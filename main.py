@@ -250,6 +250,11 @@ def worker_action(chat_id: int, user_id: int, action: str):
             pass
         bot.send_message(chat_id, "⚠️ Something went wrong. Please try again.", reply_markup=menu_kb())
 
+def back_kb():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="back"))
+    return kb
+
 # ───────────── START ─────────────
 @bot.message_handler(commands=["start"])
 def start(message):
