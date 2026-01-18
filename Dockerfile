@@ -1,7 +1,7 @@
 FROM python:3.11-slim
 
-# Create non-root user
-RUN useradd -m appuser
+# Create non-root user with allowed UID (10000–20000)
+RUN useradd -u 10001 -m appuser
 
 # Set working directory
 WORKDIR /app
@@ -19,7 +19,7 @@ COPY . .
 RUN chown -R appuser:appuser /app
 
 # Switch to non-root user
-USER appuser
+USER 10001
 
 # Environment
 ENV PYTHONUNBUFFERED=1
