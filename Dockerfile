@@ -1,16 +1,18 @@
-FROM python:3.11-slim
+import os
 
-RUN useradd -u 10001 -m appuser
-WORKDIR /app
+BASE_DIR = "/app/data"
+os.makedirs(BASE_DIR, exist_ok=True)
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
-COPY . .
-RUN chown -R appuser:appuser /app
-USER 10001
+API_ALL_ENDPOINT = os.getenv("API_ALL_ENDPOINT", "")
 
-ENV PYTHONUNBUFFERED=1
-EXPOSE 8080
+REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "")
+CHANNEL_JOIN_URL = os.getenv("CHANNEL_JOIN_URL", "")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.isdigit()}
 
-CMD ["python", "main.py"]
+CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+
+CACHE_DB_PATH = os.path.join(BASE_DIR, "cache.sqlite")
+STATS_DB_PATH = os.path.join(BASE_DIR, "stats.sqlite")
+LOGS_DB_PATH = os.path.join(BASE_DIR, "logs.sqlite")
