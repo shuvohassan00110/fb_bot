@@ -1,2 +1,5 @@
-SPINNER = ["⣾","⣽","⣻","⢿","⡿","⣟","⣯","⣷"]
-def spinner(i, t): return f"{SPINNER[i%len(SPINNER)]} <b>{t}</b>\nPlease wait..."
+SPINNER = ["⣾", "⣽", "⣻", "⢿", "⡿", "⣟", "⣯", "⣷"]
+
+def spinner(step: int, title: str) -> str:
+    ch = SPINNER[step % len(SPINNER)]
+    return f"{ch} <b>{title}</b>\n\nPlease wait..."
