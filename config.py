@@ -21,14 +21,30 @@ ADMIN_IDS = {
 }
 
 # ===============================
-# Timeouts & limits  ✅ (FIX)
+# Developer / Branding
+# ===============================
+DEVELOPER_TAG = os.getenv("DEVELOPER_TAG", "@mrseller_00")
+
+# ===============================
+# Timeouts & limits
 # ===============================
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
 
-# 🔥 THIS WAS MISSING
-MAX_IMAGE_DOWNLOAD_MB = int(os.getenv("MAX_IMAGE_DOWNLOAD_MB", "6"))
+MAX_IMAGE_DOWNLOAD_MB = int(
+    os.getenv("MAX_IMAGE_DOWNLOAD_MB", "6")
+)
 
-CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
+ZIP_PART_MAX_MB = int(
+    os.getenv("ZIP_PART_MAX_MB", "45")
+)
+
+MAX_ZIP_IMAGES_TOTAL = int(
+    os.getenv("MAX_ZIP_IMAGES_TOTAL", "120")
+)
+
+CACHE_TTL_SECONDS = int(
+    os.getenv("CACHE_TTL_SECONDS", "900")
+)
 
 # ===============================
 # SQLite paths (writable)
