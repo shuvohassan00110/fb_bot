@@ -1,28 +1,31 @@
-import sqlite3, time
-class StatsDB:
-    def __init__(self, path):
-        self.path = path
-        with sqlite3.connect(self.path) as c:
-            c.execute("CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, first_seen INTEGER, last_seen INTEGER)")
-            c.execute("CREATE TABLE IF NOT EXISTS counters (key TEXT PRIMARY KEY, val INTEGER)")
-            for k in ["requests","cache_hits","zips_generated","albums_sent","profile_sent","cover_sent","inline_queries"]:
-                c.execute("INSERT OR IGNORE INTO counters VALUES (?,0)", (k,))
-            c.commit()
+import threading
+from dataclasses import dataclass, field
+from typing import Dict, Set
 
-    def touch_user(self, uid):
-        now=int(time.time())
-        with sqlite3.connect(self.path) as c:
-            r=c.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
-            if r: c.execute("UPDATE users SET last_seen=? WHERE user_id=?", (now,uid))
-            else: c.execute("INSERT INTO users VALUES (?,?,?)",(uid,now,now))
-            c.commit()
+@dataclass
+class RuntimeState:
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    force_join: bool = True
+    maintenance: bool = False
+    last_url: Dict[int, str] = field(default_factory=dict)
+    users_seen: Set[int] = field(default_factory=set)
+    requests_count: int = 0
 
-    def inc(self,k,n=1):
-        with sqlite3.connect(self.path) as c:
-            c.execute("UPDATE counters SET val=val+? WHERE key=?",(n,k)); c.commit()
+    def set_force_join(self, v: bool):
+        with self.lock: self.force_join = v
 
-    def summary(self):
-        with sqlite3.connect(self.path) as c:
-            users=c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-            cnt=dict(c.execute("SELECT key,val FROM counters").fetchall())
-        return users,cnt
+    def set_maintenance(self, v: bool):
+        with self.lock: self.maintenance = v
+
+    def save_url(self, uid: int, url: str):
+        with self.lock:
+            self.last_url[uid] = url
+            self.users_seen.add(uid)
+
+    def get_url(self, uid: int):
+        with self.lock:
+            return self.last_url.get(uid)
+
+    def bump(self):
+        with self.lock:
+            self.requests_count += 1
