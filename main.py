@@ -1,53 +1,70 @@
-import threading
+import re
 import time
-import requests
+import threading
 import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaPhoto
+from telebot.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    InputMediaPhoto, InlineQueryResultArticle, InputTextMessageContent
+)
 
-import config
-from services.state import RuntimeState
-from services.cache import TTLCache
-from services.logger_ring import RingLogger
-from services.api_client import fetch_all
+from config import (
+    BOT_TOKEN, API_ALL_ENDPOINT,
+    REQUIRED_CHANNEL, CHANNEL_JOIN_URL,
+    ADMIN_IDS,
+    CACHE_DB_PATH, CACHE_TTL_SECONDS,
+    STATS_DB_PATH,
+    REQUEST_TIMEOUT,
+    MAX_IMAGE_DOWNLOAD_MB, ZIP_PART_MAX_MB, MAX_ZIP_IMAGES_TOTAL,
+    DEVELOPER_TAG
+)
+
+from services.api_client import ApiClient
+from services.cache import SqliteCache
+from services.loader import spinner
+from services.stats import StatsDB
+from services.access import check_force_join, is_admin
 from services.zip_builder import build_zip_parts
-from services.export_csv import export_users_csv
-from services.admin_panel import admin_kb
-from services.web_health import make_app
 
-if not config.BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set")
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-state = RuntimeState(force_join=config.DEFAULT_FORCE_JOIN, maintenance=config.DEFAULT_MAINTENANCE)
-cache = TTLCache(ttl_sec=config.CACHE_TTL_SEC)
-ringlog = RingLogger(maxlen=50)
+api = ApiClient(API_ALL_ENDPOINT, timeout=REQUEST_TIMEOUT)
+cache = SqliteCache(CACHE_DB_PATH, ttl_seconds=CACHE_TTL_SECONDS)
+stats = StatsDB(STATS_DB_PATH)
 
-bot = telebot.TeleBot(config.BOT_TOKEN, parse_mode="HTML")
+URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
+USER_LAST_URL = {}   # user_id -> fb_url
+USER_LAST_DATA = {}  # user_id -> last fetched data (for quick actions)
 
-def is_admin(uid: int) -> bool:
-    return uid in config.ADMIN_IDS
+def extract_first_url(text: str) -> str:
+    m = URL_RE.search(text or "")
+    return m.group(1) if m else ""
 
-def need_join(uid: int) -> bool:
-    if not state.force_join:
-        return False
-    if not config.REQUIRED_CHANNEL:
-        return False
-    try:
-        m = bot.get_chat_member(config.REQUIRED_CHANNEL, uid)
-        return m.status not in ("member", "administrator", "creator")
-    except Exception:
-        return True
+def is_facebook_url(url: str) -> bool:
+    t = (url or "").lower()
+    return "facebook.com" in t and (t.startswith("http://") or t.startswith("https://"))
 
-def join_kb():
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("✅ Join Channel", url=config.CHANNEL_JOIN_URL or "https://t.me/"))
-    kb.add(InlineKeyboardButton("🔄 I've Joined", callback_data="recheck_join"))
-    return kb
-
-def main_kb():
+def force_join_block(chat_id: int, user_id: int):
     kb = InlineKeyboardMarkup()
     kb.row(
-        InlineKeyboardButton("🧑 Profile HD", callback_data="profile_hd"),
-        InlineKeyboardButton("🖼 Cover HD", callback_data="cover_hd"),
+        InlineKeyboardButton("✅ Join Channel", url=CHANNEL_JOIN_URL),
+        InlineKeyboardButton("🔄 I've Joined", callback_data="recheck_join")
+    )
+    bot.send_message(
+        chat_id,
+        "<b>🔒 Access Required</b>\n\n"
+        "To use this bot, please join our channel first.\n\n"
+        f"Developer: <b>{DEVELOPER_TAG}</b>",
+        reply_markup=kb
+    )
+
+def must_join(user_id: int) -> bool:
+    return not check_force_join(bot, REQUIRED_CHANNEL, user_id)
+
+def menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("🧑 Profile (HD)", callback_data="profile_hd"),
+        InlineKeyboardButton("🖼 Cover (HD)", callback_data="cover_hd"),
     )
     kb.row(
         InlineKeyboardButton("🧩 Album 10", callback_data="album_10"),
@@ -55,261 +72,412 @@ def main_kb():
         InlineKeyboardButton("🧩 Album 40", callback_data="album_40"),
     )
     kb.row(
-        InlineKeyboardButton("📦 Smart ZIP (split)", callback_data="zip_split"),
-        InlineKeyboardButton("🧭 Admin", callback_data="admin") ,
+        InlineKeyboardButton("📦 ZIP (Size-safe)", callback_data="zip"),
+        InlineKeyboardButton("🔁 Change URL", callback_data="change_url"),
     )
     kb.row(
         InlineKeyboardButton("ℹ️ Help", callback_data="help"),
+        InlineKeyboardButton("👑 Admin", callback_data="admin"),
     )
     return kb
 
-def safe_reply(chat_id, text, **kw):
-    try:
-        return bot.send_message(chat_id, text, **kw)
-    except Exception as e:
-        ringlog.add("ERROR", f"send_message failed: {e}")
+def help_text() -> str:
+    return (
+        "<b>How to use</b>\n\n"
+        "• Send any Facebook profile URL\n"
+        "• Use buttons to get:\n"
+        "  - Profile photo (HD)\n"
+        "  - Cover photo (HD)\n"
+        "  - Album (10/20/40)\n"
+        "  - ZIP (auto split by size)\n\n"
+        "<b>Inline mode</b>\n"
+        "Type in any chat:\n"
+        "<code>@YourBotUsername https://www.facebook.com/zuck</code>\n\n"
+        f"Developer: <b>{DEVELOPER_TAG}</b>"
+    )
 
-def call_api(fb_url: str):
-    # cache by URL
+def admin_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.row(
+        InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
+        InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
+    )
+    kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back"))
+    return kb
+
+def back_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="back"))
+    return kb
+
+def fetch_profile_data(fb_url: str):
+    stats.inc("requests", 1)
     cached = cache.get(fb_url)
-    if cached:
+    if cached and cached.get("success"):
+        stats.inc("cache_hits", 1)
         return cached
-    if not config.API_ALL_ENDPOINT:
-        return None
-    data = fetch_all(config.API_ALL_ENDPOINT, fb_url)
+
+    data = api.fetch(fb_url)
     if data and data.get("success"):
         cache.set(fb_url, data)
     return data
 
-@bot.message_handler(commands=["start"])
-def start(m):
-    uid = m.from_user.id
-    if state.maintenance and (not is_admin(uid)):
-        safe_reply(m.chat.id, "🛠 <b>Maintenance mode</b>\nTry again later.")
+def send_album(chat_id: int, data: dict, count: int):
+    photos = data.get("photos", []) or []
+    media = [InputMediaPhoto(u) for u in photos[:count] if u]
+    if not media:
+        bot.send_message(chat_id, "No public photos found.", reply_markup=menu_kb())
         return
-    if need_join(uid):
-        safe_reply(m.chat.id, "🔒 <b>Join required</b> to use this bot.", reply_markup=join_kb())
-        return
-
-    safe_reply(
-        m.chat.id,
-        "🤖 <b>GADGET ADVANCE TOOLS</b>\n"
-        "Send a Facebook profile URL.\n\n"
-        "Developer: <b>@mrseller_00</b>",
-        reply_markup=main_kb()
+    bot.send_media_group(chat_id, media)
+    stats.inc("albums_sent", 1)
+    bot.send_message(
+        chat_id,
+        f"✅ <b>Album sent</b> (<b>{len(media)}</b> images)\n"
+        f"Total found: <b>{data.get('total_count', 0)}</b>\n\n"
+        f"Developer: <b>{DEVELOPER_TAG}</b>",
+        reply_markup=menu_kb()
     )
 
-@bot.callback_query_handler(func=lambda c: c.data == "recheck_join")
-def recheck_join(c):
-    uid = c.from_user.id
-    if need_join(uid):
-        bot.answer_callback_query(c.id, "Still not joined.")
-        return
-    bot.answer_callback_query(c.id, "Access granted ✅")
-    safe_reply(c.message.chat.id, "Now send a Facebook URL.", reply_markup=main_kb())
-
-@bot.message_handler(func=lambda m: bool(m.text) and ("facebook.com" in m.text.lower()))
-def got_url(m):
-    uid = m.from_user.id
-    if state.maintenance and (not is_admin(uid)):
-        safe_reply(m.chat.id, "🛠 <b>Maintenance mode</b>\nTry again later.")
-        return
-    if need_join(uid):
-        safe_reply(m.chat.id, "🔒 <b>Join required</b> to use this bot.", reply_markup=join_kb())
+def worker_action(chat_id: int, user_id: int, action: str):
+    if must_join(user_id):
+        force_join_block(chat_id, user_id)
         return
 
-    url = m.text.strip()
-    state.save_url(uid, url)
-    safe_reply(m.chat.id, "✅ URL saved. Choose an option:", reply_markup=main_kb())
-
-@bot.callback_query_handler(func=lambda c: True)
-def on_click(c):
-    uid = c.from_user.id
-
-    # Admin panel open
-    if c.data == "admin":
-        if not is_admin(uid):
-            bot.answer_callback_query(c.id, "Not admin.")
-            return
-        bot.answer_callback_query(c.id)
-        safe_reply(
-            c.message.chat.id,
-            "🧭 <b>Admin Panel</b>",
-            reply_markup=admin_kb(state.force_join, state.maintenance)
-        )
-        return
-
-    # Admin actions
-    if c.data.startswith("adm_"):
-        if not is_admin(uid):
-            bot.answer_callback_query(c.id, "Not admin.")
-            return
-
-        if c.data == "adm_toggle_force":
-            state.set_force_join(not state.force_join)
-            bot.answer_callback_query(c.id, "Updated")
-            safe_reply(c.message.chat.id, "Updated ✅", reply_markup=admin_kb(state.force_join, state.maintenance))
-            return
-
-        if c.data == "adm_toggle_maint":
-            state.set_maintenance(not state.maintenance)
-            bot.answer_callback_query(c.id, "Updated")
-            safe_reply(c.message.chat.id, "Updated ✅", reply_markup=admin_kb(state.force_join, state.maintenance))
-            return
-
-        if c.data == "adm_cache_purge":
-            cache.purge()
-            bot.answer_callback_query(c.id, "Cache purged")
-            safe_reply(c.message.chat.id, "🧹 Cache purged ✅", reply_markup=admin_kb(state.force_join, state.maintenance))
-            return
-
-        if c.data == "adm_export_users":
-            csv_bytes = export_users_csv(state.users_seen)
-            bot.answer_callback_query(c.id, "Exporting…")
-            bot.send_document(c.message.chat.id, ("users.csv", csv_bytes), caption="📄 Users export")
-            return
-
-        if c.data == "adm_logs":
-            logs = ringlog.tail(50)
-            bot.answer_callback_query(c.id, "Showing logs")
-            text = "<b>🧾 Last 50 errors</b>\n\n" + ("\n".join(logs) if logs else "No errors ✅")
-            safe_reply(c.message.chat.id, text[:3800])  # telegram limit guard
-            return
-
-        if c.data == "adm_health":
-            bot.answer_callback_query(c.id, "Checking…")
-            ok = False
-            detail = ""
-            if config.API_ALL_ENDPOINT:
-                try:
-                    # health endpoint may not exist; try HEAD/GET base
-                    r = requests.get(config.API_ALL_ENDPOINT, timeout=15)
-                    ok = (r.status_code < 500)
-                    detail = f"HTTP {r.status_code}"
-                except Exception as e:
-                    detail = str(e)
-            safe_reply(c.message.chat.id, f"❤️ API Health: <b>{'OK' if ok else 'FAIL'}</b>\n{detail}")
-            return
-
-    # Non-admin / general actions
-    if state.maintenance and (not is_admin(uid)):
-        bot.answer_callback_query(c.id, "Maintenance")
-        return
-    if need_join(uid):
-        bot.answer_callback_query(c.id, "Join required")
-        safe_reply(c.message.chat.id, "🔒 Join required.", reply_markup=join_kb())
-        return
-
-    if c.data == "help":
-        bot.answer_callback_query(c.id)
-        safe_reply(
-            c.message.chat.id,
-            "<b>How to use</b>\n"
-            "1) Send a Facebook profile URL\n"
-            "2) Choose Profile/Cover/Album/ZIP\n\n"
-            "✅ Choose count: 10 / 20 / 40\n"
-            "📦 ZIP will auto-split if big\n",
-            reply_markup=main_kb()
-        )
-        return
-
-    fb_url = state.get_url(uid)
+    fb_url = USER_LAST_URL.get(user_id)
     if not fb_url:
-        bot.answer_callback_query(c.id, "Send URL first")
+        bot.send_message(chat_id, "🔗 Send a Facebook URL first.", reply_markup=menu_kb())
         return
 
-    # Load data
-    bot.answer_callback_query(c.id, "Working…")
-    msg = safe_reply(c.message.chat.id, "⏳ Processing…")
-    try:
-        data = call_api(fb_url)
-        state.bump()
-    except Exception as e:
-        ringlog.add("ERROR", f"API call failed: {e}")
-        data = None
+    loading = bot.send_message(chat_id, spinner(0, "Working"))
+    msg_id = loading.message_id
 
-    try:
-        if msg:
-            bot.delete_message(c.message.chat.id, msg.message_id)
-    except:
-        pass
+    for step in range(1, 4):
+        try:
+            bot.edit_message_text(spinner(step, "Working"), chat_id, msg_id)
+        except Exception:
+            pass
+        time.sleep(0.25)
+
+    data = USER_LAST_DATA.get(user_id)
+    if not data or not data.get("success"):
+        data = fetch_profile_data(fb_url)
+        USER_LAST_DATA[user_id] = data
 
     if not data or not data.get("success"):
-        safe_reply(c.message.chat.id, "❌ Failed to fetch. Profile may be private or blocked.", reply_markup=main_kb())
-        return
-
-    # Actions
-    if c.data == "profile_hd":
-        p = data.get("profile_picture", {}).get("hd")
-        if p:
-            bot.send_photo(c.message.chat.id, p, caption="🧑 Profile (HD)", reply_markup=main_kb())
-        else:
-            safe_reply(c.message.chat.id, "No profile picture found.", reply_markup=main_kb())
-        return
-
-    if c.data == "cover_hd":
-        p = data.get("cover_photo", {}).get("hd")
-        if p:
-            bot.send_photo(c.message.chat.id, p, caption="🖼 Cover (HD)", reply_markup=main_kb())
-        else:
-            safe_reply(c.message.chat.id, "No cover photo found.", reply_markup=main_kb())
-        return
-
-    if c.data.startswith("album_"):
-        n = int(c.data.split("_")[1])
-        photos = data.get("photos", [])[:n]
-        media = [InputMediaPhoto(u) for u in photos if isinstance(u, str)]
-        if not media:
-            safe_reply(c.message.chat.id, "No photos found.", reply_markup=main_kb())
-            return
-        # Telegram media group limit is 10 per group
-        for i in range(0, len(media), 10):
-            bot.send_media_group(c.message.chat.id, media[i:i+10])
-        safe_reply(c.message.chat.id, f"✅ Album sent ({len(media)})", reply_markup=main_kb())
-        return
-
-    if c.data == "zip_split":
-        urls = data.get("all_images", []) or []
-        if not urls:
-            safe_reply(c.message.chat.id, "No images found for ZIP.", reply_markup=main_kb())
-            return
-
-        safe_reply(c.message.chat.id, "📦 Building ZIP (auto-split)…")
+        err = (data or {}).get("message") or (data or {}).get("error") or "Failed to fetch profile."
         try:
-            parts, files_added = build_zip_parts(urls, part_max_mb=config.ZIP_PART_MAX_MB)
-        except Exception as e:
-            ringlog.add("ERROR", f"zip build failed: {e}")
-            safe_reply(c.message.chat.id, "ZIP failed.", reply_markup=main_kb())
-            return
-
-        if not parts:
-            safe_reply(c.message.chat.id, "ZIP empty (no downloadable images).", reply_markup=main_kb())
-            return
-
-        for name, bio in parts:
-            try:
-                bot.send_document(c.message.chat.id, (name, bio), caption=f"📦 {name}")
-            except Exception as e:
-                ringlog.add("ERROR", f"send_document failed: {e}")
-
-        safe_reply(c.message.chat.id, f"✅ ZIP done. Files: {files_added}, Parts: {len(parts)}", reply_markup=main_kb())
+            bot.edit_message_text(
+                f"❌ <b>Failed</b>\n\n{err}\n\nTry another public profile.\n\nDeveloper: <b>{DEVELOPER_TAG}</b>",
+                chat_id, msg_id, reply_markup=menu_kb()
+            )
+        except Exception:
+            bot.send_message(chat_id, f"❌ Failed: {err}", reply_markup=menu_kb())
         return
 
-
-def run_health_server():
-    app = make_app(state, cache, ringlog)
-    # Choreo wants a port; use 8080
-    app.run(host="0.0.0.0", port=8080, debug=False)
-
-print("🤖 Advanced Bot v5 starting…")
-
-t = threading.Thread(target=run_health_server, daemon=True)
-t.start()
-
-# Strong polling settings to reduce API hiccups
-while True:
     try:
-        bot.infinity_polling(skip_pending=True, timeout=30, long_polling_timeout=20)
-    except Exception as e:
-        ringlog.add("ERROR", f"polling crashed: {e}")
-        time.sleep(3)
+        if action == "profile_hd":
+            url = data.get("profile_picture", {}).get("hd") or data.get("profile_picture", {}).get("standard")
+            bot.delete_message(chat_id, msg_id)
+            if url:
+                bot.send_photo(chat_id, url, caption=f"🧑 <b>Profile Picture (HD)</b>\nDeveloper: <b>{DEVELOPER_TAG}</b>", reply_markup=menu_kb())
+                stats.inc("profile_sent", 1)
+            else:
+                bot.send_message(chat_id, "No profile picture found.", reply_markup=menu_kb())
+
+        elif action == "cover_hd":
+            url = data.get("cover_photo", {}).get("hd") or data.get("cover_photo", {}).get("standard")
+            bot.delete_message(chat_id, msg_id)
+            if url:
+                bot.send_photo(chat_id, url, caption=f"🖼 <b>Cover Photo (HD)</b>\nDeveloper: <b>{DEVELOPER_TAG}</b>", reply_markup=menu_kb())
+                stats.inc("cover_sent", 1)
+            else:
+                bot.send_message(chat_id, "No cover photo found.", reply_markup=menu_kb())
+
+        elif action.startswith("album_"):
+            bot.delete_message(chat_id, msg_id)
+            count = int(action.split("_")[1])
+            send_album(chat_id, data, count)
+
+        elif action == "zip":
+            bot.edit_message_text(spinner(6, "Building ZIP (size-safe split)"), chat_id, msg_id)
+
+            all_images = data.get("all_images", []) or []
+            zip_parts, added, skipped = build_zip_parts(
+                urls=all_images,
+                timeout=REQUEST_TIMEOUT,
+                max_total_images=MAX_ZIP_IMAGES_TOTAL,
+                max_each_mb=MAX_IMAGE_DOWNLOAD_MB,
+                part_max_mb=ZIP_PART_MAX_MB
+            )
+
+            bot.delete_message(chat_id, msg_id)
+
+            if added == 0 or not zip_parts:
+                bot.send_message(chat_id, "❌ Could not build ZIP (maybe blocked/private).", reply_markup=menu_kb())
+                return
+
+            stats.inc("zips_generated", 1)
+
+            # Send each ZIP part
+            for i, zbytes in enumerate(zip_parts, start=1):
+                filename = f"facebook_images_part_{i}.zip" if len(zip_parts) > 1 else "facebook_images.zip"
+                bot.send_document(
+                    chat_id,
+                    (filename, zbytes),
+                    caption=(
+                        f"📦 <b>ZIP Part {i}/{len(zip_parts)}</b>\n"
+                        f"Added so far: <b>{added}</b> | Skipped: <b>{skipped}</b>\n"
+                        f"Developer: <b>{DEVELOPER_TAG}</b>"
+                    )
+                )
+
+            bot.send_message(chat_id, "✅ Done. Send another URL anytime.", reply_markup=menu_kb())
+
+        else:
+            bot.delete_message(chat_id, msg_id)
+            bot.send_message(chat_id, "Unknown action.", reply_markup=menu_kb())
+
+    except Exception:
+        try:
+            bot.delete_message(chat_id, msg_id)
+        except Exception:
+            pass
+        bot.send_message(chat_id, "⚠️ Something went wrong. Please try again.", reply_markup=menu_kb())
+
+# ───────────── START ─────────────
+@bot.message_handler(commands=["start"])
+def start(message):
+    stats.touch_user(message.from_user.id)
+
+    if must_join(message.from_user.id):
+        force_join_block(message.chat.id, message.from_user.id)
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "<b>👋 Welcome!</b>\n\n"
+        "Send a <b>Facebook profile URL</b> and use the menu.\n\n"
+        "Example:\n<code>https://www.facebook.com/zuck</code>\n\n"
+        f"Developer: <b>{DEVELOPER_TAG}</b>",
+        reply_markup=menu_kb()
+    )
+
+# ───────────── CALLBACKS ─────────────
+@bot.callback_query_handler(func=lambda c: True)
+def cb(call):
+    user_id = call.from_user.id
+    chat_id = call.message.chat.id
+    stats.touch_user(user_id)
+
+    if call.data == "recheck_join":
+        if must_join(user_id):
+            bot.answer_callback_query(call.id, "Still not joined. Please join first.")
+            return
+        bot.answer_callback_query(call.id, "Access granted ✅")
+        bot.send_message(chat_id, "✅ Access granted! Now send a Facebook URL.", reply_markup=menu_kb())
+        return
+
+    if call.data == "help":
+        bot.edit_message_text(help_text(), chat_id, call.message.message_id, reply_markup=back_kb())
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data == "back":
+        bot.edit_message_text("✅ <b>Menu</b>\n\nSend a Facebook URL anytime.", chat_id, call.message.message_id, reply_markup=menu_kb())
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data == "change_url":
+        bot.send_message(chat_id, "🔗 Send a new Facebook profile URL.")
+        bot.answer_callback_query(call.id)
+        return
+
+    # Admin panel entry
+    if call.data == "admin":
+        if not is_admin(user_id, ADMIN_IDS):
+            bot.answer_callback_query(call.id, "Not authorized.")
+            return
+        bot.edit_message_text("👑 <b>Admin Panel</b>", chat_id, call.message.message_id, reply_markup=admin_kb())
+        bot.answer_callback_query(call.id)
+        return
+
+    # Admin stats
+    if call.data == "admin_stats":
+        if not is_admin(user_id, ADMIN_IDS):
+            bot.answer_callback_query(call.id, "Not authorized.")
+            return
+        users, counters = stats.get_summary()
+        text = (
+            "📊 <b>Bot Stats</b>\n\n"
+            f"Users: <b>{users}</b>\n"
+            f"Requests: <b>{counters.get('requests',0)}</b>\n"
+            f"Cache hits: <b>{counters.get('cache_hits',0)}</b>\n"
+            f"Profile sent: <b>{counters.get('profile_sent',0)}</b>\n"
+            f"Cover sent: <b>{counters.get('cover_sent',0)}</b>\n"
+            f"Albums sent: <b>{counters.get('albums_sent',0)}</b>\n"
+            f"ZIP generated: <b>{counters.get('zips_generated',0)}</b>\n"
+            f"Inline queries: <b>{counters.get('inline_queries',0)}</b>\n\n"
+            f"Developer: <b>{DEVELOPER_TAG}</b>"
+        )
+        bot.send_message(chat_id, text, reply_markup=admin_kb())
+        bot.answer_callback_query(call.id)
+        return
+
+    # Admin broadcast (simple)
+    if call.data == "admin_broadcast":
+        if not is_admin(user_id, ADMIN_IDS):
+            bot.answer_callback_query(call.id, "Not authorized.")
+            return
+        bot.send_message(chat_id, "📢 Send broadcast like:\n<code>/broadcast Your message here</code>")
+        bot.answer_callback_query(call.id)
+        return
+
+    # Actions in threads
+    action = call.data
+    threading.Thread(target=worker_action, args=(chat_id, user_id, action), daemon=True).start()
+    bot.answer_callback_query(call.id)
+
+# ───────────── BROADCAST COMMAND ─────────────
+@bot.message_handler(commands=["broadcast"])
+def broadcast(message):
+    user_id = message.from_user.id
+    if not is_admin(user_id, ADMIN_IDS):
+        bot.reply_to(message, "Not authorized.")
+        return
+
+    parts = (message.text or "").split(" ", 1)
+    if len(parts) < 2 or not parts[1].strip():
+        bot.reply_to(message, "Usage:\n<code>/broadcast Your message</code>")
+        return
+
+    text = parts[1].strip()
+
+    # send to all known users
+    import sqlite3
+    from config import STATS_DB_PATH
+
+    sent = 0
+    failed = 0
+    conn = sqlite3.connect(STATS_DB_PATH)
+    rows = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+
+    bot.reply_to(message, f"Broadcast started to {len(rows)} users...")
+
+    for (uid,) in rows:
+        try:
+            bot.send_message(uid, f"📢 <b>Announcement</b>\n\n{text}\n\nDeveloper: <b>{DEVELOPER_TAG}</b>")
+            sent += 1
+        except Exception:
+            failed += 1
+
+    bot.send_message(message.chat.id, f"✅ Broadcast done.\nSent: {sent}\nFailed: {failed}")
+
+# ───────────── URL INPUT ─────────────
+@bot.message_handler(func=lambda m: True)
+def on_message(message):
+    user_id = message.from_user.id
+    stats.touch_user(user_id)
+
+    if must_join(user_id):
+        force_join_block(message.chat.id, user_id)
+        return
+
+    url = extract_first_url((message.text or "").strip())
+    if url and is_facebook_url(url):
+        USER_LAST_URL[user_id] = url
+        USER_LAST_DATA[user_id] = None
+        bot.send_message(
+            message.chat.id,
+            f"✅ URL saved:\n<code>{url}</code>\n\nChoose an action:",
+            reply_markup=menu_kb()
+        )
+        return
+
+    bot.send_message(
+        message.chat.id,
+        "🔗 Please send a valid Facebook profile URL.\nExample: <code>https://www.facebook.com/zuck</code>\n\n"
+        f"Developer: <b>{DEVELOPER_TAG}</b>",
+        reply_markup=menu_kb()
+    )
+
+# ───────────── INLINE MODE ─────────────
+@bot.inline_handler(func=lambda q: True)
+def inline_handler(inline_query):
+    stats.inc("inline_queries", 1)
+    user_id = inline_query.from_user.id
+
+    # Force join for inline: show instruction result
+    if must_join(user_id):
+        r = InlineQueryResultArticle(
+            id="join_required",
+            title="🔒 Join required to use inline",
+            description="Tap to get join instructions",
+            input_message_content=InputTextMessageContent(
+                f"🔒 Please join the channel first: {CHANNEL_JOIN_URL}\nDeveloper: {DEVELOPER_TAG}"
+            )
+        )
+        bot.answer_inline_query(inline_query.id, [r], cache_time=1, is_personal=True)
+        return
+
+    text = (inline_query.query or "").strip()
+    url = extract_first_url(text)
+
+    if not (url and is_facebook_url(url)):
+        r = InlineQueryResultArticle(
+            id="help",
+            title="Paste a Facebook profile URL",
+            description="Example: https://www.facebook.com/zuck",
+            input_message_content=InputTextMessageContent(
+                "Send inline like:\n@YourBotUsername https://www.facebook.com/zuck\n\nDeveloper: " + DEVELOPER_TAG
+            )
+        )
+        bot.answer_inline_query(inline_query.id, [r], cache_time=1, is_personal=True)
+        return
+
+    # fetch quickly (cache helps)
+    data = fetch_profile_data(url)
+    if not data or not data.get("success"):
+        msg = (data or {}).get("message") or "Failed to fetch profile (maybe private)."
+        r = InlineQueryResultArticle(
+            id="failed",
+            title="❌ Failed to fetch",
+            description=msg,
+            input_message_content=InputTextMessageContent(f"❌ {msg}\nDeveloper: {DEVELOPER_TAG}")
+        )
+        bot.answer_inline_query(inline_query.id, [r], cache_time=1, is_personal=True)
+        return
+
+    profile = data.get("profile_picture", {}).get("hd") or data.get("profile_picture", {}).get("standard")
+    cover = data.get("cover_photo", {}).get("hd") or data.get("cover_photo", {}).get("standard")
+    total = data.get("total_count", 0)
+
+    # Inline results as “articles” (safe)
+    results = []
+
+    results.append(
+        InlineQueryResultArticle(
+            id="r1",
+            title="🧑 Profile Picture (HD)",
+            description="Send profile photo link",
+            input_message_content=InputTextMessageContent(
+                f"🧑 Profile (HD):\n{profile}\n\nTotal images found: {total}\nDeveloper: {DEVELOPER_TAG}"
+            )
+        )
+    )
+    if cover:
+        results.append(
+            InlineQueryResultArticle(
+                id="r2",
+                title="🖼 Cover Photo (HD)",
+                description="Send cover photo link",
+                input_message_content=InputTextMessageContent(
+                    f"🖼 Cover (HD):\n{cover}\n\nTotal images found: {total}\nDeveloper: {DEVELOPER_TAG}"
+                )
+            )
+        )
+
+    bot.answer_inline_query(inline_query.id, results, cache_time=5, is_personal=True)
+
+print("🤖 Bot v3 running...")
+bot.infinity_polling(skip_pending=True)
