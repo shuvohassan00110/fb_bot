@@ -1,10 +1,10 @@
 import os
 
-BASE_DIR = "/app/data"
+# 🔥 Choreo writable directory
+BASE_DIR = "/tmp/botdata"
 os.makedirs(BASE_DIR, exist_ok=True)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-
 API_ALL_ENDPOINT = os.getenv("API_ALL_ENDPOINT", "")
 
 REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "")
