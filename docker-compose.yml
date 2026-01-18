@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  fb_bot:
+    build: .
+    container_name: fb_bot_v4
+    restart: unless-stopped
+
+    environment:
+      BOT_TOKEN: "8138779207:AAEEOnMGiO6UTK9pSv7TgK4LuLXWvQkEhQo"
+      API_ALL_ENDPOINT: "http://YOUR_API_IP:5000/api/all"
+
+      REQUIRED_CHANNEL: "@gadgetpremiumzone"
+      CHANNEL_JOIN_URL: "https://t.me/gadgetpremiumzone"
+
+      ADMIN_IDS: "7857957075"
+
+      CACHE_TTL_SECONDS: "600"
+      REQUEST_TIMEOUT: "45"
+
+      MAX_IMAGE_DOWNLOAD_MB: "6"
+      ZIP_PART_MAX_MB: "45"
+      MAX_ZIP_IMAGES_TOTAL: "120"
+
+    volumes:
+      - ./data:/app/data
