@@ -1,7 +1,11 @@
-import requests, time
-def check_api_health(url, timeout=10):
+import requests
+import time
+
+def check_api_health(api_url: str, timeout=10):
     try:
-        s=time.time(); r=requests.get(url,timeout=timeout)
-        return True, r.status_code, round(time.time()-s,2)
+        start = time.time()
+        r = requests.get(api_url, timeout=timeout)
+        latency = round(time.time() - start, 2)
+        return True, r.status_code, latency
     except Exception as e:
         return False, str(e), None
