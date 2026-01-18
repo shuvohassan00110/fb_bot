@@ -13,7 +13,6 @@ from config import (
     ADMIN_IDS,
     CACHE_DB_PATH, CACHE_TTL_SECONDS,
     STATS_DB_PATH,
-    REQUEST_TIMEOUT,
     MAX_IMAGE_DOWNLOAD_MB, ZIP_PART_MAX_MB, MAX_ZIP_IMAGES_TOTAL,
     DEVELOPER_TAG
 )
@@ -27,7 +26,7 @@ from services.zip_builder import build_zip_parts
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
-api = ApiClient(API_ALL_ENDPOINT, timeout=REQUEST_TIMEOUT)
+api = ApiClient(API_ALL_ENDPOINT, timeout=45)
 cache = SqliteCache(CACHE_DB_PATH, ttl_seconds=CACHE_TTL_SECONDS)
 stats = StatsDB(STATS_DB_PATH)
 
