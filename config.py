@@ -11,6 +11,9 @@ REQUIRED_CHANNEL = os.getenv("REQUIRED_CHANNEL", "")
 CHANNEL_JOIN_URL = os.getenv("CHANNEL_JOIN_URL", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.isdigit()}
 
+# ✅ ADD THIS
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
+
 CACHE_TTL_SECONDS = int(os.getenv("CACHE_TTL_SECONDS", "900"))
 
 CACHE_DB_PATH = os.path.join(BASE_DIR, "cache.sqlite")
