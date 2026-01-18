@@ -96,18 +96,25 @@ def help_text() -> str:
         f"Developer: <b>{DEVELOPER_TAG}</b>"
     )
 
-def admin_kb() -> InlineKeyboardMarkup:
+def admin_kb():
     kb = InlineKeyboardMarkup()
     kb.row(
         InlineKeyboardButton("📊 Stats", callback_data="admin_stats"),
+        InlineKeyboardButton("📁 Export Users (CSV)", callback_data="admin_export"),
+    )
+    kb.row(
+        InlineKeyboardButton("🧾 Logs (last 50)", callback_data="admin_logs"),
+        InlineKeyboardButton("🩺 API Health", callback_data="admin_health"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔐 Force Join ON/OFF", callback_data="admin_force"),
+        InlineKeyboardButton("🛠 Maintenance ON/OFF", callback_data="admin_maint"),
+    )
+    kb.row(
+        InlineKeyboardButton("🧹 Purge Cache", callback_data="admin_cache"),
         InlineKeyboardButton("📢 Broadcast", callback_data="admin_broadcast"),
     )
     kb.row(InlineKeyboardButton("⬅️ Back", callback_data="back"))
-    return kb
-
-def back_kb() -> InlineKeyboardMarkup:
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("⬅️ Back", callback_data="back"))
     return kb
 
 def fetch_profile_data(fb_url: str):
